@@ -14,7 +14,7 @@ export TMPDIR="${TMPDIR:-/tmp}"
 if [ -v TRIGGER ] && [[ "$TRIGGER" != "" ]]; then
   PACKAGES=()
   TO_BUILD=()
-  UTIL_GET_PACKAGES PACKAGES
+  UTIL_LOAD_PACKAGES
   for package in "${PACKAGES[@]}"; do
     unset VARIABLES
     declare -A VARIABLES=()
@@ -38,20 +38,25 @@ if [ -v TEMPLATE_ENABLE_UPDATES ] && [ "$TEMPLATE_ENABLE_UPDATES" == "true" ]; t
   { .ci/update-template.sh && UTIL_PRINT_INFO "Updated CI template." && exit 0; } || true
 fi
 
-# Check if the scheduled tag does not exist or scheduled does not point to HEAD
-if ! [ "$(git tag -l "scheduled")" ] || [ "$(git rev-parse HEAD)" != "$(git rev-parse scheduled)" ]; then
-  UTIL_PRINT_ERROR "Previous on-commit pipeline did not seem to run successfully. Aborting."
-  exit 1
+if [[ "${SKIP_ON_COMMIT_CHECK:-false}" != "true" && -z "${CI_TEST_PACKAGE:-}" && -z "${CI_TEST_PACKAGES:-}" ]]; then
+  # Check if the scheduled tag does not exist or scheduled does not point to HEAD
+  if ! [ "$(git tag -l "scheduled")" ] || [ "$(git rev-parse HEAD)" != "$(git rev-parse scheduled)" ]; then
+    UTIL_PRINT_ERROR "Previous on-commit pipeline did not seem to run successfully. Aborting."
+    exit 1
+  fi
+else
+  UTIL_PRINT_INFO "Skipping previous on-commit pipeline check because this is a test run or SKIP_ON_COMMIT_CHECK=true"
 fi
 
 PACKAGES=()
 declare -A AUR_TIMESTAMPS
 declare -A AUR_MAINTAINERS
 LAST_AUR_TIMESTAMP=0
+AUR_FETCH_FAILED=false
 MODIFIED_PACKAGES=()
 declare -A CHANGED_LIBS=()
 DELETE_BRANCHES=()
-UTIL_GET_PACKAGES PACKAGES
+UTIL_LOAD_PACKAGES
 COMMIT="${COMMIT:-false}"
 COMMIT_MESSAGE_PACKAGES=()
 
@@ -66,7 +71,7 @@ function manage_state() {
   git worktree add .newstate -B state --orphan -q
 }
 
-# Loop through all packages to do optimized aur RPC calls
+# Collect timestamps and maintainer info for all AUR packages managed by this repository.
 # $1 = Output associative timestamp array
 # $2 = Output associative maintainers array
 function collect_aur_info() {
@@ -80,7 +85,6 @@ function collect_aur_info() {
   if [ -f .ci/aur-state ]; then
     LAST_AUR_TIMESTAMP="$(<.ci/aur-state)"
   fi
-  date +%s >.ci/aur-state
 
   for package in "${PACKAGES[@]}"; do
     unset VARIABLES
@@ -95,8 +99,14 @@ function collect_aur_info() {
     fi
   done
 
-  # Get all timestamps from AUR
-  http_proxy="$CI_AUR_PROXY" https_proxy="$CI_AUR_PROXY" UTIL_FETCH_AUR_INFO collect_aur_timestamps_output collect_aur_maintainers_output "${AUR_PACKAGES[*]}"
+  # Only advance the watermark once a snapshot was actually fetched. Otherwise
+  # a failed fetch would silently make the next run skip updates that happened
+  # in the meantime.
+  if UTIL_FETCH_AUR_INFO collect_aur_timestamps_output collect_aur_maintainers_output "${AUR_PACKAGES[*]}"; then
+    date +%s >.ci/aur-state
+  else
+    AUR_FETCH_FAILED=true
+  fi
 }
 
 function collect_changed_libs() {
@@ -114,9 +124,19 @@ function collect_changed_libs() {
   local _TEMP_LIB
   _TEMP_LIB="$(mktemp -d)"
 
+  # Parse all configured databases in parallel; each writes to its own state file
+  local repo jobs=()
   for repo in "${link_array[@]}"; do
-    UTIL_PARSE_DATABASE "${repo}" "${_TEMP_LIB}"
+    # shellcheck disable=SC2086
+    ( UTIL_PARSE_DATABASE "${repo}" "${_TEMP_LIB}" ) 2>/dev/null &
+    jobs+=("$!")
   done
+
+  for job in "${jobs[@]}"; do
+    wait "$job" || true
+  done
+
+  cat "${_TEMP_LIB}"/version-state-* >"${_TEMP_LIB}/version-state" 2>/dev/null || true
 
   # Sort versions file in-place because comm requires it
   sort -o "${_TEMP_LIB}/version-state"{,}
@@ -131,15 +151,13 @@ function collect_changed_libs() {
   rm -rf "$_TEMP_LIB"
 }
 
+# Accumulate the update commits in memory and only commit once at the end of
+# phase B, since create-pr no longer depends on the state of the main branch.
 function generate-commit() {
   if [[ "$1" != ".final" ]]; then
     COMMIT_MESSAGE_PACKAGES+=("$1")
-    if [[ "$COMMIT" == "false" ]]; then
-      COMMIT=true
-    else
-      git commit -q --amend --no-edit
-      return
-    fi
+    COMMIT=true
+    return
   fi
 
   local COMMIT_MESSAGE COMMIT_DESCRIPTION
@@ -152,13 +170,7 @@ function generate-commit() {
     COMMIT_MESSAGE+=" [skip ci]"
   fi
 
-  local commit_args=("-q")
-  if [[ "$1" == ".final" ]]; then
-    commit_args+=("--amend")
-  fi
-
-  commit_args+=("-m" "$COMMIT_MESSAGE")
-
+  local commit_args=("-q" "-m" "$COMMIT_MESSAGE")
   if [[ -n "$COMMIT_DESCRIPTION" ]]; then
     commit_args+=("-m" "$COMMIT_DESCRIPTION")
   fi
@@ -260,12 +272,15 @@ function package_major_change_sum_legal() {
 # Otherwise, no output is given
 function package_major_change() {
   set -euo pipefail
-  local newFileLine oldFileLine inSums
+  local newFileLine oldFileLine inSums allowPatterns allowRegexes
   inSums=false
+  allowPatterns="${3:-}"
 
   local pkgverRegex='^_?pkgver *= *[a-zA-Z0-9_.-]+[[:space:]]*$'
   local pkgrelRegex='^pkgrel *= *[a-zA-Z0-9_.-]+[[:space:]]*$'
   local sumsArrayStartRegex='^(sha(1|224|256|384|512)|md5|b2)sums(_(x86_64|i686|aarch64|armv7h))? *= *\((.*)$'
+
+  IFS=';' read -ra allowRegexes <<<"$allowPatterns"
 
   # Compare file line by line
   while true; do
@@ -316,6 +331,14 @@ function package_major_change() {
       # Exact match, ignore this
       continue
     fi
+
+    # Check if the line matches a package-specific allowlist regex
+    for pattern in "${allowRegexes[@]}"; do
+      if [ -z "$pattern" ]; then continue; fi
+      if [[ "$newFileLine" =~ $pattern ]] && [[ "$oldFileLine" =~ $pattern ]]; then
+        continue 2
+      fi
+    done
 
     # Normalize any kinds of quotes in the lines for the following checks
     newFileLine="$(package_major_change_normalize "$newFileLine")"
@@ -369,8 +392,10 @@ function update_via_git() {
 
   if package_changed "$pkgbuild_path" "$pkgbase"; then
     if [ -v CI_HUMAN_REVIEW ] && [ "$CI_HUMAN_REVIEW" == "true" ]; then
-      local package_major_change_output
-      if ! package_major_change_output="$(package_major_change "$pkgbuild_path" "$pkgbase")"; then
+      local package_major_change_output allow_regex
+      allow_regex="${VARIABLES_VIA_GIT[CI_PKGBUILD_CHANGE_ALLOW_REGEX]:-}"
+
+      if ! package_major_change_output="$(package_major_change "$pkgbuild_path" "$pkgbase" "$allow_regex")"; then
         UTIL_PRINT_ERROR "$pkgbase: Error running major change check."
         return
       fi
@@ -470,7 +495,9 @@ function update_pkgbuild() {
 
     # Fetch from optimized AUR RPC call
     if ! [ -v "AUR_TIMESTAMPS[$pkgbase]" ]; then
-      UTIL_PRINT_WARNING "Could not find $pkgbase in cached AUR timestamps."
+      if [ "$AUR_FETCH_FAILED" != "true" ]; then
+        UTIL_PRINT_WARNING "Could not find $pkgbase in cached AUR timestamps."
+      fi
       return 0
     fi
     local NEW_TIMESTAMP="${AUR_TIMESTAMPS[$pkgbase]}"
@@ -480,6 +507,22 @@ function update_pkgbuild() {
     fi
     http_proxy="$CI_AUR_PROXY" https_proxy="$CI_AUR_PROXY" update_via_git VARIABLES_UPDATE_PKGBUILD "$git_url" "$pkgbase"
   fi
+}
+
+# Ask the should-build endpoint for a package. The per-package setting
+# overrides the global CI_SHOULD_BUILD_CHECK. Returns non-zero when the
+# backend reports a failure loop for the package.
+# $1: VARIABLES array name
+function should_schedule() {
+  set -euo pipefail
+  local -n pkg_config=${1:-VARIABLES}
+  local check="${CI_SHOULD_BUILD_CHECK:-false}"
+  check="${check//\"/}"
+  if [ -v "pkg_config[CI_SHOULD_BUILD_CHECK]" ]; then
+    check="${pkg_config[CI_SHOULD_BUILD_CHECK]//\"/}"
+  fi
+  [ "$check" == "true" ] || return 0
+  UTIL_SHOULD_BUILD "${pkg_config[PKGBASE]}"
 }
 
 function update_vcs() {
@@ -500,6 +543,12 @@ function update_vcs() {
 
   if [ -z "$_NEWEST_COMMIT" ]; then
     unset "VARIABLES_UPDATE_VCS[CI_GIT_COMMIT]"
+    return 0
+  fi
+
+  # Only this recurring git-hash update consults the endpoint. A deny keeps
+  # the old hash, so the next scheduled run asks again.
+  if ! should_schedule VARIABLES_UPDATE_VCS; then
     return 0
   fi
 
@@ -539,15 +588,14 @@ function update_nvchecker() {
   fi
 
   local json_output exit_code
-  json_output=$(nvchecker --file "$config_file" --logger=json 2>/dev/null)
-  exit_code=$?
+  exit_code=0
+  json_output="$(nvchecker --file "$config_file" --logger=json 2>/dev/null || exit_code=$?)"
 
-  if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 3 ]; then
-    UTIL_PRINT_WARNING "$pkgbase: nvchecker failed to execute (exit code $exit_code)."
-    return 0
-  fi
   if [ "$exit_code" -eq 3 ]; then
     UTIL_PRINT_WARNING "$pkgbase: nvchecker reported failures while checking updates."
+  elif [ "$exit_code" -ne 0 ]; then
+    UTIL_PRINT_WARNING "$pkgbase: nvchecker failed to execute (exit code $exit_code)."
+    return 0
   fi
 
   local version
@@ -556,8 +604,6 @@ function update_nvchecker() {
 
   local revision
   revision=$(jq -r 'select(.event == "updated") | .revision // ""' <<<"$json_output" 2>/dev/null || true)
-
-  UTIL_PRINT_INFO "$pkgbase: nvchecker detected update to $version."
 
   if [ ! -f "$pkgbase/PKGBUILD" ]; then
     return 0
@@ -576,13 +622,32 @@ function update_nvchecker() {
     return 0
   fi
 
+  UTIL_PRINT_INFO "$pkgbase: nvchecker detected update to $version."
+
+  # Backup files before modifying them so we can restore without touching the git index
+  local backup_dir
+  backup_dir="$(mktemp -d "${TMPDIR}/nvchecker-backup.XXXXXX")"
+  cp "$pkgbase/PKGBUILD" "$backup_dir/"
+  if [ -f "$pkgbase/.SRCINFO" ]; then
+    cp "$pkgbase/.SRCINFO" "$backup_dir/"
+  fi
+
   gawk -i inplace -f .ci/awk/update-pkgbuild-nvchecker.awk \
     -v TARGET_VERSION="$target_version" \
     -v TARGET_REVISION="$revision" \
     -v OLD_VERSION="$old_version" \
     "$pkgbase/PKGBUILD"
 
-  UTIL_UPDATE_CHECKSUMS "$pkgbase"
+  if ! UTIL_UPDATE_CHECKSUMS "$pkgbase"; then
+    UTIL_PRINT_WARNING "$pkgbase: Checksum update failed. Reverting changes."
+    cp "$backup_dir/PKGBUILD" "$pkgbase/PKGBUILD"
+    if [ -f "$backup_dir/.SRCINFO" ]; then
+      cp "$backup_dir/.SRCINFO" "$pkgbase/.SRCINFO"
+    fi
+    rm -rf "$backup_dir"
+    return 0
+  fi
+  rm -rf "$backup_dir"
 
   VARIABLES_UPDATE_NVCHECKER[CI_ANY_UPDATE]=true
   if [ "${CI_NVCHECKER_REVIEW:-false}" == "true" ]; then
@@ -665,14 +730,22 @@ collect_changed_libs CHANGED_LIBS
 
 UTIL_SETUP_CLONE
 
-# Loop through all packages to check if they need to be updated
-for package in "${PACKAGES[@]}"; do
+# Phase A (parallel): workers must not touch the git index/HEAD — phase B does.
+
+UPDATE_RESULTS_DIR="${TMPDIR}/update-results"
+UPDATE_LOGS_DIR="${TMPDIR}/update-logs"
+mkdir -p "$UPDATE_RESULTS_DIR" "$UPDATE_LOGS_DIR"
+
+# $1: package
+function update_package_worker() {
+  set -euo pipefail
+  local package="$1"
   unset VARIABLES
   declare -A VARIABLES=()
   UTIL_READ_MANAGED_PACAKGE "$package" VARIABLES || true
 
   if [[ "${VARIABLES[CI_NVCHECKER]:-false}" == "true" ]]; then
-    update_nvchecker VARIABLES
+    update_nvchecker VARIABLES || { UTIL_PRINT_ERROR "$package: nvchecker update failed with an unknown error."; return 0; }
   else
     update_pkgbuild VARIABLES
   fi
@@ -683,20 +756,52 @@ for package in "${PACKAGES[@]}"; do
   UTIL_LOAD_CUSTOM_HOOK "./${package}" "./${package}/.CI/update.sh" && VARIABLES[CI_ANY_UPDATE]=true || true
   UTIL_WRITE_MANAGED_PACKAGE "$package" VARIABLES
 
-  if [ "${VARIABLES[CI_ANY_UPDATE]:-false}" != "true" ]; then
-    continue
+  # Record the outcome so the serial phase can pick this package up
+  if [ "${VARIABLES[CI_ANY_UPDATE]:-false}" == "true" ]; then
+    {
+      echo "CI_REQUIRES_REVIEW=${VARIABLES[CI_REQUIRES_REVIEW]:-false}"
+      echo "CI_NVCHECKER_REVIEW_REQUIRED=${VARIABLES[CI_NVCHECKER_REVIEW_REQUIRED]:-false}"
+    } >"${UPDATE_RESULTS_DIR}/${package}.result"
   fi
+}
+
+function update_package_worker_logged() {
+  local package="$1"
+  # Stream live while keeping a per-package log for the record.
+  update_package_worker "$package" 2>&1 | tee "${UPDATE_LOGS_DIR}/${package}.log"
+}
+
+CI_MAX_PARALLEL="$(UTIL_RESOLVE_MAX_PARALLEL)"
+
+UTIL_PRINT_INFO "Checking ${#PACKAGES[@]} packages for updates in parallel ($CI_MAX_PARALLEL workers)..."
+UTIL_RUN_PARALLEL "$CI_MAX_PARALLEL" "${PACKAGES[@]}" -- update_package_worker_logged
+
+# Phase B (serial): all git operations happen here.
+
+for package in "${PACKAGES[@]}"; do
+  result_file="${UPDATE_RESULTS_DIR}/${package}.result"
+  [ -f "$result_file" ] || continue
+
+  unset VARIABLES
+  declare -A VARIABLES=()
+  UTIL_READ_MANAGED_PACAKGE "$package" VARIABLES || true
+
+  # Recover the transient flags recorded by the worker
+  CI_REQUIRES_REVIEW=false
+  CI_NVCHECKER_REVIEW_REQUIRED=false
+  while IFS= read -r line; do
+    case "$line" in
+      CI_REQUIRES_REVIEW=*) CI_REQUIRES_REVIEW="${line#*=}" ;;
+      CI_NVCHECKER_REVIEW_REQUIRED=*) CI_NVCHECKER_REVIEW_REQUIRED="${line#*=}" ;;
+    esac
+  done <"$result_file"
 
   if ! git diff --exit-code --quiet -- "$package"; then
     # shellcheck disable=SC2102
-    if [[ -v VARIABLES[CI_REQUIRES_REVIEW] ]] && [ "${VARIABLES[CI_REQUIRES_REVIEW]}" == "true" ]; then
-      if [[ -v VARIABLES[CI_NVCHECKER_REVIEW_REQUIRED] ]] && [ "${VARIABLES[CI_NVCHECKER_REVIEW_REQUIRED]}" == "true" ]; then
+    if [ "$CI_REQUIRES_REVIEW" == "true" ]; then
+      if [ "$CI_NVCHECKER_REVIEW_REQUIRED" == "true" ]; then
         UTIL_PRINT_INFO "$package: Creating PR for review due to CI_NVCHECKER_REVIEW."
-        if [ "$COMMIT" == "false" ]; then
-          .ci/create-pr.sh "$package" false "$CI_HUMAN_REVIEW_ASSIGNEE" nvchecker
-        else
-          .ci/create-pr.sh "$package" true "$CI_HUMAN_REVIEW_ASSIGNEE" nvchecker
-        fi
+        .ci/create-pr.sh "$package" "$CI_HUMAN_REVIEW_ASSIGNEE" nvchecker
         continue
       fi
 
@@ -712,13 +817,7 @@ for package in "${PACKAGES[@]}"; do
         # Drop back to normal update flow
       else
         UTIL_PRINT_INFO "$package: Creating PR for review due to untrusted maintainer(s)$maintainer_info"
-        if [ "$COMMIT" == "false" ]; then
-          .ci/create-pr.sh "$package" false "$CI_HUMAN_REVIEW_ASSIGNEE"
-        else
-          # If we already made a commit, we should go one commit further back to avoid merge conflicts
-          # This is because there is a very high chance this current commit will be amended
-          .ci/create-pr.sh "$package" true "$CI_HUMAN_REVIEW_ASSIGNEE"
-        fi
+        .ci/create-pr.sh "$package" "$CI_HUMAN_REVIEW_ASSIGNEE"
         # Prevent from dropping into the normal update flow, since we already created the PR
         continue
       fi
@@ -767,8 +866,16 @@ if [ "$COMMIT" == "true" ]; then
   git add .ci/aur-state
   generate-commit ".final"
 
-  git tag -f scheduled
-  git push --atomic origin HEAD:main +state +refs/tags/scheduled "${git_push_args[@]}"
+  git tag -f scheduled >/dev/null
+  if ! push_output=$(git push --quiet --atomic origin HEAD:main +state +refs/tags/scheduled "${git_push_args[@]}" 2>&1); then
+    UTIL_PRINT_ERROR "Failed to push main/state/scheduled:\n$push_output"
+    exit 1
+  fi
+  UTIL_PRINT_INFO "Pushed main, state and scheduled tag."
 else
-  git push --atomic origin +state "${git_push_args[@]}"
+  if ! push_output=$(git push --quiet --atomic origin +state "${git_push_args[@]}" 2>&1); then
+    UTIL_PRINT_ERROR "Failed to push state:\n$push_output"
+    exit 1
+  fi
+  UTIL_PRINT_INFO "Pushed state."
 fi

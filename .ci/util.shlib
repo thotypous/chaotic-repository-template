@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # shellcheck disable=2034
 
-KNOWN_VARIABLE_LIST=(CI_PKGBUILD_SOURCE CI_PACKAGE_BUMP CI_FORCE_VCS CI_ON_TRIGGER CI_MANAGE_AUR CI_NVCHECKER CI_REBUILD_TRIGGERS BUILDER_CACHE_SOURCES BUILDER_EXTRA_TIMEOUT BUILDER_CLASS BUILDER_ALLOW_PROHIBITED)
+KNOWN_VARIABLE_LIST=(CI_PKGBUILD_SOURCE CI_PACKAGE_BUMP CI_FORCE_VCS CI_ON_TRIGGER CI_MANAGE_AUR CI_NVCHECKER CI_PKGBUILD_CHANGE_ALLOW_REGEX CI_REBUILD_TRIGGERS CI_SHOULD_BUILD_CHECK BUILDER_CACHE_SOURCES BUILDER_EXTRA_TIMEOUT BUILDER_CLASS BUILDER_ALLOW_PROHIBITED)
 KNOWN_STATE_VARIABLE_LIST=(CI_GIT_COMMIT)
 declare -A KNOWN_CONFIG_LIST=([BUILD_REPO]="chaotic-aur"
     [CI_AUR_PROXY]=""
     [CI_CLONE_DELAY]="0"
     [CI_CLONE_DELAY]="0"
     [CI_CODE_SKIP]=123
+    [CI_MAX_PARALLEL]="8"
     [CI_DEFAULT_CLASS]=""
     [CI_HUMAN_REVIEW]="false"
     [CI_HUMAN_REVIEW_ASSIGNEE]=""
@@ -16,6 +17,8 @@ declare -A KNOWN_CONFIG_LIST=([BUILD_REPO]="chaotic-aur"
     [CI_MANAGE_AUR]="false"
     [CI_REBUILD_BLACKLIST]=""
     [CI_REBUILD_TRIGGERS]=""
+    [CI_SHOULD_BUILD_CHECK]="false"
+    [CI_SHOULD_BUILD_ENDPOINT]="https://aur.chaotic.cx/backend"
     [GIT_AUTHOR_EMAIL]="ci@example.com"
     [GIT_AUTHOR_NAME]="chaotic-aur"
     [REDIS_PORT]="6379"
@@ -34,6 +37,18 @@ function UTIL_GET_PACKAGES() {
     set -euo pipefail
     local -n GET_PACKAGES_ARRAY=${1:-PACKAGES}
     mapfile -t GET_PACKAGES_ARRAY < <(find . -mindepth 1 -maxdepth 1 -type d -not -path '*/.*' -printf '%P\n')
+}
+
+# Load packages with optional test package filtering
+function UTIL_LOAD_PACKAGES() {
+    set -euo pipefail
+    if [ -n "${CI_TEST_PACKAGE:-}" ]; then
+        PACKAGES=("$CI_TEST_PACKAGE")
+    elif [ -n "${CI_TEST_PACKAGES:-}" ]; then
+        IFS=':' read -r -a PACKAGES <<<"$CI_TEST_PACKAGES"
+    else
+        UTIL_GET_PACKAGES PACKAGES
+    fi
 }
 
 # $1: File to read variables from
@@ -154,6 +169,7 @@ function UTIL_FETCH_VCS_COMMIT() {
 
     # Check if .SRCINFO exists. We can't work with a -git package without it
     if ! [ -f "$pkgbase/.SRCINFO" ]; then
+        UTIL_PRINT_WARNING "$pkgbase: .SRCINFO not found. Cannot fetch the latest commit."
         return 1
     fi
 
@@ -187,11 +203,14 @@ function UTIL_FETCH_VCS_COMMIT() {
         ref="${fragment##*=}"
     fi
 
-    local _NEWEST_COMMIT
-    if ! _NEWEST_COMMIT="$({ git ls-remote "$source" "$ref" 2>/dev/null || [ $? == 141 ]; } | grep -m1 -oP '\w+(?=\t\w)')"; then
+    local _NEWEST_COMMIT _LS_REMOTE_OUTPUT
+    if ! _LS_REMOTE_OUTPUT="$(git ls-remote "$source" "$ref" 2>&1)"; then
+        UTIL_PRINT_WARNING "$pkgbase: git ls-remote failed: $(head -n 1 <<<"$_LS_REMOTE_OUTPUT")"
         return 1
     fi
+    _NEWEST_COMMIT="$(grep -m1 -oP '\w+(?=\t\w)' <<<"$_LS_REMOTE_OUTPUT" || true)"
     if [ -z "$_NEWEST_COMMIT" ]; then
+        UTIL_PRINT_WARNING "$pkgbase: git ls-remote gave no commit for ref '$ref'."
         return 1
     fi
 
@@ -210,8 +229,46 @@ function UTIL_UPDATE_VCS_COMMIT() {
     fi
 }
 
-# $1: Output associative array
-# $2: array of pkgbases on AUR
+function UTIL_RESOLVE_MAX_PARALLEL() {
+    set -euo pipefail
+    local value="${CI_MAX_PARALLEL//\"}"
+    value="${value:-8}"
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        UTIL_PRINT_WARNING "Invalid CI_MAX_PARALLEL value '$value', falling back to 8."
+        value=8
+    fi
+    [ "$value" -lt 1 ] && value=1
+    echo "$value"
+}
+
+# Usage: UTIL_RUN_PARALLEL <max> <item...> -- <command...>
+# Runs <command...> once per item (item passed as $1), bounded to <max> jobs.
+function UTIL_RUN_PARALLEL() {
+    set -euo pipefail
+    local max="$1"; shift
+    local -a items=()
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+        items+=("$1"); shift
+    done
+    shift  # drop "--"
+    local -a cmd=("$@")
+    local running=0 item
+    for item in "${items[@]}"; do
+        "${cmd[@]}" "$item" &
+        running=$((running + 1))
+        if [ "$running" -ge "$max" ]; then
+            wait -n || true
+            running=$((running - 1))
+        fi
+    done
+    wait || true
+}
+
+# Fetch timestamp and maintainer info for AUR packages from a single metadata
+# dump download instead of one RPC call per package.
+# $1: Output associative timestamp array
+# $2: Output associative maintainer array
+# $3: Pkgbases to look up (space-separated)
 function UTIL_FETCH_AUR_INFO() {
     set -euo pipefail
     local -n OUTPUT_ASSOC_TIMESTAMP_ARRAY=$1
@@ -225,46 +282,103 @@ function UTIL_FETCH_AUR_INFO() {
         return 0
     fi
 
-    local API_URL="https://aur.archlinux.org/rpc/v5/info"
-    local first=1
+    local meta_url="https://aur.archlinux.org/packages-meta-ext-v1.json.gz"
+    local work_dir
+    work_dir="$(mktemp -d)"
+    trap "rm -rf '${work_dir}'" RETURN
+    local dump_file="$work_dir/dump.json.gz" names_file="$work_dir/names.txt" json_file="$work_dir/meta.json"
 
-    # Loop through $2 but via index numbers. If index != 0, append &arg[]= to the URL
-    for i in "${!pkgbases[@]}"; do
-        if [ "$first" -eq 1 ]; then
-            API_URL+="?arg[]=${pkgbases[$i]}"
-            first=0
-        else
-            API_URL+="&arg[]=${pkgbases[$i]}"
-        fi
+    # The config reader keeps the surrounding quotes, so strip them first
+    local aur_proxy="${CI_AUR_PROXY//\"/}"
 
-        # Every 150 packages or at the end of the array, fetch the timestamps
-        if [ $((i % 150)) -eq 149 ] || [ "$i" -eq "$((${#pkgbases[@]} - 1))" ]; then
-            local response
+    if ! http_proxy="$aur_proxy" https_proxy="$aur_proxy" curl -sf "$meta_url" -o "$dump_file"; then
+        UTIL_PRINT_ERROR "Failed to fetch AUR metadata from $meta_url"
+        return 1
+    fi
+    gzip -dc "$dump_file" > "$json_file"
 
-            # Ensure also packages containing "+" can be fetched, since this is a special character in URLs
-            API_URL=${API_URL//+/%2B}
+    # Build the set of packages we care about and filter the dump in one jq pass
+    printf '%s\n' "${pkgbases[@]}" > "$names_file"
+    local wanted_names
+    wanted_names="$(jq -R -s 'split("\n") | map(select(length > 0)) | map({(.): true}) | add' "$names_file")"
 
-            UTIL_PRINT_INFO "Fetching AUR timestamps for $((i + 1))/${#pkgbases[@]} packages..."
-            if response="$(curl -sf "$API_URL")"; then
-                local -a res_timestamps
-                mapfile -t res_timestamps <<<"$(jq -r '.results[].LastModified' <<<"$response")"
-                local -a res_pkgbases
-                mapfile -t res_pkgbases <<<"$(jq -r '.results[].PackageBase' <<<"$response")"
-                local -a res_maintainers
-                mapfile -t res_maintainers < <(jq -r '.results[] | (.Maintainer // "unknown") as $m | ((.CoMaintainers // []) | join(",")) as $c | if $c != "" then "\($m),\($c)" else $m end' <<<"$response")
+    local -a aur_entries
+    mapfile -t aur_entries < <(
+        # shellcheck disable=SC2016
+        jq -r --argjson wanted "$wanted_names" '.[]
+            | select(.PackageBase as $pb | $wanted[$pb])
+            | [.PackageBase,
+               (.LastModified | tostring),
+               ((.Maintainer // "unknown") as $m | ((.CoMaintainers // []) | join(",")) as $c
+                | if $c != "" then "\($m),\($c)" else $m end)]
+            | @tsv' "$json_file"
+    )
 
-                # Loop through timestamps and pkgbases and add them to the associative array
-                for j in "${!res_timestamps[@]}"; do
-                    OUTPUT_ASSOC_TIMESTAMP_ARRAY["${res_pkgbases[$j]}"]="${res_timestamps[$j]}"
-                    OUTPUT_ASSOC_MAINTAINER_ARRAY["${res_pkgbases[$j]}"]="${res_maintainers[$j]}"
-                done
-            else
-                UTIL_PRINT_ERROR "Failed to fetch AUR timestamps from $API_URL"
-            fi
-            API_URL="https://aur.archlinux.org/rpc/v5/info"
-            first=1
-        fi
+    # Merge the entries into the output arrays
+    local entry pkgbase timestamp maintainers
+    for entry in "${aur_entries[@]}"; do
+        [ -n "$entry" ] || continue
+        IFS=$'\t' read -r pkgbase timestamp maintainers <<<"$entry"
+        OUTPUT_ASSOC_TIMESTAMP_ARRAY["$pkgbase"]="$timestamp"
+        OUTPUT_ASSOC_MAINTAINER_ARRAY["$pkgbase"]="$maintainers"
     done
+}
+
+# Ask the backend should-build endpoint if a build for pkgbase can succeed.
+# The backend reports shouldBuild=false for packages in a failure loop. The
+# endpoint reports true again after a cooldown. If the backend does not
+# answer, the function lets the build proceed.
+# $1: pkgbase
+function UTIL_SHOULD_BUILD() {
+    set -euo pipefail
+    local pkgbase="$1"
+
+    if [ -z "${CI_SHOULD_BUILD_ENDPOINT:-}" ]; then
+        UTIL_PRINT_WARNING "$pkgbase: CI_SHOULD_BUILD_ENDPOINT is not set, proceeding with the build."
+        return 0
+    fi
+
+    # The config reader keeps the surrounding quotes, so strip them first
+    local backend_url="${CI_SHOULD_BUILD_ENDPOINT//\"/}"
+    local endpoint="${backend_url%/}/builder/should-build/${pkgbase}"
+    local response
+    if ! response="$(curl --fail-with-body --silent --connect-timeout 10 --max-time 30 "$endpoint")"; then
+        UTIL_PRINT_WARNING "$pkgbase: Failed to query should-build endpoint, proceeding with the build."
+        return 0
+    fi
+
+    local should_build consecutive_failures
+    # The jq // operator turns a literal false into the fallback. tostring does not.
+    should_build="$(jq -r '.shouldBuild | tostring' <<<"$response" 2>/dev/null || true)"
+    consecutive_failures="$(jq -r '.consecutiveFailures // "unknown"' <<<"$response" 2>/dev/null || true)"
+
+    if [[ "$should_build" == "false" ]]; then
+        UTIL_PRINT_WARNING "$pkgbase: Skipping build, backend reports a failure loop ($consecutive_failures consecutive failures)."
+        return 1
+    fi
+    return 0
+}
+
+# $1: package directory
+function UTIL_GET_LOCAL_SOURCE_FILES() {
+    set -euo pipefail
+    local srcinfo="$1/.SRCINFO"
+    if [ ! -f "$srcinfo" ]; then
+        return 0
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*(source(_[[:alnum:]_]+)?|install|changelog)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local value="${BASH_REMATCH[3]}"
+            # Unwrap the name::path rename syntax and use only the RHS
+            if [[ "$value" == *"::"* ]]; then
+                value="${value#*::}"
+            fi
+            if [[ "$value" == *"://"* ]]; then
+                continue
+            fi
+            [ -n "$value" ] && printf '%s\n' "$value"
+        fi
+    done < "$srcinfo"
 }
 
 # Generate exclude list for rsync, diff, etc.
@@ -344,6 +458,7 @@ function UTIL_PARSE_DATABASE() {
     tar -xf "${tmp_dir}/${repo}/${repo}.db" -C "${tmp_dir}/${repo}"
 
     # Use find with xargs instead of -exec to avoid pipeline issues
+    # Each repo writes to its own state file so invocations can run in parallel
     while read -r pkgbase version; do
         # Skip empty lines
         [[ -n "$pkgbase" && -n "$version" ]] || continue
@@ -354,7 +469,7 @@ function UTIL_PARSE_DATABASE() {
         if [[ -v already_parsed["${normalized_pkgbase}"] ]]; then
             continue
         else
-            echo "$pkgbase:$version" >>"${tmp_dir}/version-state"
+            echo "$pkgbase:$version" >>"${tmp_dir}/version-state-${repo}"
             already_parsed["$normalized_pkgbase"]="true"
         fi
     done < <(find "${tmp_dir}/${repo}" -maxdepth 2 -name 'desc' -print0 | xargs -0 gawk -f .ci/awk/parse-database.awk)
@@ -488,12 +603,27 @@ function UTIL_UPDATE_CHECKSUMS() {
     local newsums
     if ! newsums=$(cd "$TEMP_DIR" && sudo -u nobody makepkg -g 2>/dev/null); then
         UTIL_PRINT_WARNING "$pkgbase: Failed to generate new checksums."
-    else
-        gawk -i inplace -f .ci/awk/update-sums.awk \
-            -v sumtypes="$sumtypes" \
-            -v newsums="$newsums" \
-            "$pkgbase/PKGBUILD"
+            rm -rf "$TEMP_DIR"
+            return 1
+        fi
+
+        if [ -z "$newsums" ]; then
+            UTIL_PRINT_WARNING "$pkgbase: Failed to generate new checksums."
+            rm -rf "$TEMP_DIR"
+            return 1
     fi
+        awk -v newsums="$newsums" '
+        BEGIN {
+            if (!newsums) exit 1
+        }
+
+        /^[[:blank:]]*(md5|b2|sha[0-9]+)sums(_(x86_64|i686|aarch64|armv7h))?=/, /\)[[:blank:]]*$/ {
+            if (!i) print newsums; i++
+            next
+        }
+
+        1
+        ' "$pkgbase/PKGBUILD" >"$pkgbase/PKGBUILD.new" && mv "$pkgbase/PKGBUILD.new" "$pkgbase/PKGBUILD"
 
     if [ -f "$pkgbase/.SRCINFO" ]; then
         cp "$pkgbase/PKGBUILD" "$TEMP_DIR/PKGBUILD"
@@ -513,6 +643,10 @@ function UTIL_SET_GIT_IDENTITY() {
     # Silence some very insane log spam. Main is set by default and the silenced
     # message is declared as hint.
     git config --global init.defaultBranch "main"
+
+    # AUR packages often carry trailing whitespace in their PKGBUILD; the
+    # path-scoped stash applies the diff via git apply and warns about it.
+    git config --global apply.whitespace nowarn
 }
 
 function UTIL_SETUP_CLONE() {
